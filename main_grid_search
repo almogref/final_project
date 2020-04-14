@@ -1,0 +1,444 @@
+%tensorflow_version 1.x
+import keras.backend as K
+import tensorflow as tf
+
+
+def graph_conv_op(x, num_filters, graph_conv_filters, kernel):
+
+    if len(x.get_shape()) == 2:
+        conv_op = K.dot(graph_conv_filters, x)
+        conv_op = tf.split(conv_op, num_filters, axis=0)
+        conv_op = K.concatenate(conv_op, axis=1)
+    elif len(x.get_shape()) == 3:
+        conv_op = K.batch_dot(graph_conv_filters, x)
+        conv_op = tf.split(conv_op, num_filters, axis=1)
+        conv_op = K.concatenate(conv_op, axis=2)
+    else:
+        raise ValueError('x must be either 2 or 3 dimension tensor'
+                         'Got input shape: ' + str(x.get_shape()))
+
+    conv_out = K.dot(conv_op, kernel)
+    return conv_out
+
+import numpy as np
+import pandas as pd
+import subprocess
+import os
+import sys
+import gc
+
+from keras import optimizers, regularizers, callbacks
+from keras.models import Sequential , Model
+from keras.layers import Lambda, Dense, Activation, Flatten, Convolution1D, Dropout , Input , Conv1D , MaxPooling2D, MaxPooling1D , LSTM, concatenate
+from scipy.stats import pearsonr
+
+
+from keras import activations, initializers, constraints
+from keras import regularizers
+import keras.backend as K
+from keras.engine.topology import Layer
+import tensorflow as tf
+
+# Excel Feature
+from openpyxl import workbook 
+from openpyxl import load_workbook
+# Define the id of the processing tab
+ID_NUM = 5
+
+class MultiGraphCNN(Layer):
+
+    def __init__(self,
+                 output_dim,
+                 num_filters,
+                 activation=None,
+                 use_bias=True,
+                 kernel_initializer='glorot_uniform',
+                 bias_initializer='zeros',
+                 kernel_regularizer=None,
+                 bias_regularizer=None,
+                 activity_regularizer=None,
+                 kernel_constraint=None,
+                 bias_constraint=None,
+                 **kwargs):
+        super(MultiGraphCNN, self).__init__(**kwargs)
+
+        self.output_dim = output_dim
+        self.num_filters = num_filters
+
+        self.activation = activations.get(activation)
+        self.use_bias = use_bias
+        self.kernel_initializer = initializers.get(kernel_initializer)
+        self.kernel_initializer._name_ = kernel_initializer
+        self.bias_initializer = initializers.get(bias_initializer)
+        self.kernel_regularizer = regularizers.get(kernel_regularizer)
+        self.bias_regularizer = regularizers.get(bias_regularizer)
+        self.activity_regularizer = regularizers.get(activity_regularizer)
+        self.kernel_constraint = constraints.get(kernel_constraint)
+        self.bias_constraint = constraints.get(bias_constraint)
+
+    def build(self, input_shape):
+
+        if self.num_filters != int(input_shape[1][-2]/input_shape[1][-1]):
+            raise ValueError('num_filters does not match with graph_conv_filters dimensions.')
+
+        self.input_dim = input_shape[0][-1]
+        kernel_shape = (self.num_filters * self.input_dim, self.output_dim)
+
+        self.kernel = self.add_weight(shape=kernel_shape,
+                                      initializer=self.kernel_initializer,
+                                      name='kernel',
+                                      regularizer=self.kernel_regularizer,
+                                      constraint=self.kernel_constraint)
+        if self.use_bias:
+            self.bias = self.add_weight(shape=(self.output_dim,),
+                                        initializer=self.bias_initializer,
+                                        name='bias',
+                                        regularizer=self.bias_regularizer,
+                                        constraint=self.bias_constraint)
+        else:
+            self.bias = None
+
+        self.built = True
+
+    def call(self, inputs):
+
+        output = graph_conv_op(inputs[0], self.num_filters, inputs[1], self.kernel)
+        if self.use_bias:
+            output = K.bias_add(output, self.bias)
+        if self.activation is not None:
+            output = self.activation(output)
+        return output
+
+    def compute_output_shape(self, input_shape):
+        output_shape = (input_shape[0][0], input_shape[0][1], self.output_dim)
+        return output_shape
+
+    def get_config(self):
+        config = {
+            'output_dim': self.output_dim,
+            'num_filters': self.num_filters,
+            'activation': activations.serialize(self.activation),
+            'use_bias': self.use_bias,
+            'kernel_initializer': initializers.serialize(self.kernel_initializer),
+            'bias_initializer': initializers.serialize(self.bias_initializer),
+            'kernel_regularizer': regularizers.serialize(self.kernel_regularizer),
+            'bias_regularizer': regularizers.serialize(self.bias_regularizer),
+            'activity_regularizer': regularizers.serialize(self.activity_regularizer),
+            'kernel_constraint': constraints.serialize(self.kernel_constraint),
+            'bias_constraint': constraints.serialize(self.bias_constraint)
+        }
+        base_config = super(MultiGraphCNN, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+
+def prep_data(df, protein):
+    path = "norm_data.txt"
+    #columns = list(df)
+    # i=0
+    # for j in columns:
+    #     if (i>2):
+    #         #df[j]=df[j].astype(float).fillna(0)
+    #         df[j]=df[j].clip(lower=None, upper=df[j].quantile(0.995))
+    #     i=i+1
+    # N_rows = 21 #FIXME - this is for coding time, change to actual num later.
+
+    for col in df.columns.values:
+        if ((col!='RNA_Seq') & (col!=protein) & (col!='Probe_Set') & (col!='adj_mat_raw')):
+            #print("dropping ", col)
+            df = df.drop([col],axis=1)
+
+    df[protein] = df[protein].astype(float)
+    df[protein] = df[protein].clip(lower=None, upper=df[protein].quantile(0.995))
+
+    df = df.dropna()
+    print(df.dtypes)
+    print(df.isnull().values.any())
+
+    train = df[df['Probe_Set'] == 'SetA']
+    train = train.reset_index()
+    train['one_hot'] = one_hot_encode_(train['RNA_Seq'])
+    train['adj_mat'] = expand_matrices(train['adj_mat_raw'])
+    train = train.drop(['index', 'RNA_Seq', 'Probe_Set', 'adj_mat_raw'], axis=1)
+    train_data = train.copy()
+    train_data = train_data.drop(protein,axis=1)
+    train_target = train[protein]
+
+    test = df[df['Probe_Set'] == 'SetB']
+    test = test.reset_index()
+    test['one_hot'] = one_hot_encode_(test['RNA_Seq'])
+    test['adj_mat'] = expand_matrices(test['adj_mat_raw'])
+    test = test.drop(['index', 'RNA_Seq', 'Probe_Set', 'adj_mat_raw'], axis=1)
+    test_data = test.copy()
+    test_data = test_data.drop(protein,axis=1)
+    test_target = test[protein]
+
+    gc.collect()
+    return train_data, train_target, test_data, test_target
+
+
+
+def expand_matrices(raw_mats):
+    dims = len(raw_mats)
+    matrices = []
+    adj_basic = np.zeros((41, 41))
+    num_of_par = 0
+    total_par = 0
+    # First we count total amount of parenthesis pairs
+    for i in range(dims):
+        if raw_mats[i] == '(':
+            total_par = total_par + 1
+
+    for i in range(dims):
+        if raw_mats[i] == '.':
+            if i != 0:
+                adj_basic[i, i - 1] = 1
+                adj_basic[i - 1, i] = 1
+            if i != dims - 1:
+                adj_basic[i, i + 1] = 1
+                adj_basic[i + 1, i] = 1
+        elif raw_mats[i] == '(':
+            # finding the matching parenthesis, and matching to it
+            num_of_par = num_of_par + 1
+            found_par = 0
+            for j in range(dims):
+                if raw_mats[j] == ')':
+                    found_par = found_par + 1
+                # The closing parenthesis matches the opposite open parenthesis. \
+                # I.E. if there are 5 in total, 1 matches 5, 2 matches 4 etc.
+                if found_par == (total_par - num_of_par + 1):
+                    adj_basic[i, j] = 1
+                    adj_basic[j, i] = 1
+                    break
+    # adj_plus_id = adj_basic + np.identity(dims)
+
+    # np.set_printoptions(threshold=sys.maxsize)
+    # print("basic: \n")
+    # print(adj_basic)
+    # print("id: \n")
+    # print(adj_plus_id)
+    # print(adj_basic)
+        matrices.append(adj_basic)
+    return matrices
+
+
+
+def create_raw_matrices(seqs):
+    path = "C:\Program Files (x86)\ViennaRNA Package"
+    os.chdir(path)
+    raw_mats = []
+    process = subprocess.Popen("RNAfold", stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    index = 0
+    for seq in seqs:
+        index = index + 1
+        input_str = "".join(seq) + '\n'
+        print(index , "- now graphing ", input_str)
+        process.stdin.write(bytes(input_str, 'utf-8'))
+        process.stdin.flush()
+        process.stdout.readline().decode('utf-8')
+        text_graph = process.stdout.readline().decode('utf-8').split(' ')[0]
+        print(text_graph)
+        process.stdout.flush()
+        raw_mats.append(text_graph)
+    return raw_mats
+
+
+def prep_first_time():
+
+    # Read the basic data
+    df = pd.read_csv("norm_data.txt", delimiter="\t", header=None)
+    new_header = df.iloc[0]  # grab the first row for the header
+    df = df[1:]  # take the data less the header row
+    df.columns = new_header  # set the header row as the df header
+    df['adj_mat_raw'] = create_raw_matrices(df['RNA_Seq'])
+    df.to_csv("/content/drive/My Drive/norm_data.csv", index = False)
+    return df
+
+def one_hot_encode_(seqs):
+    padded_arrays = []
+    for seq in seqs:
+        mapping = dict(zip("ACUG", range(4)))
+        seq2 = [mapping[i] for i in seq]
+        pre_padded = np.eye(4)[seq2]
+        padded_array = np.zeros((41, 4))
+        padded_array[0:len(seq), :] = pre_padded
+        padded_arrays.append(padded_array)
+    return padded_arrays
+
+def predict_protein(data,protein,early_stop_patience,C1_units,C2_units,D1_units,DropVal_1,DropVal_2,early_stop_delta,epochs):
+      gc.collect()
+      df = data.copy()
+      print(df.dtypes)
+      x_train, y_train, x_test, y_test = prep_data(df,protein)
+      print(x_train.dtypes)
+      print(x_train.columns.values)
+      print(y_train.dtype)
+      assert not y_train.isnull().values.any()
+      print(x_test.shape)
+      print(len(y_test))
+
+      # train_data, train_target, test_data, test_target = prep_data()
+      # gc.collect()
+      # print(train_data)
+
+      # print(train_data['Probe_Set'].values)
+      # print(train_data['Probe_ID'].values)
+      #stringer = "AGGGCGGGCGAUACGGACACCGGAAUUUACUUAAGUGG"
+      X =  np.stack(x_train['one_hot'])
+      print(X.shape)
+      print(X.dtype)
+      assert not np.any(np.isnan(X))
+      adj_tensor = np.stack(x_train['adj_mat'])
+      print(adj_tensor.shape)
+      Y = np.column_stack(y_train).transpose()
+      print(Y.shape)
+      print(Y.dtype)
+      assert not np.any(np.isnan(Y))
+      graph_conv_filters = []
+      for i in range(adj_tensor.shape[0]):
+          adj = adj_tensor[i]
+          adj = adj + np.eye(adj.shape[0])
+          d = np.diag(np.power(np.array(adj.sum(1)), -0.5).flatten(), 0)
+          adj = adj.dot(d).transpose().dot(d)
+          adj = np.concatenate([np.eye(adj.shape[0]), adj], axis=0)
+          if np.isnan(adj).any():
+              print("found_nan!")
+
+          graph_conv_filters.append(adj)
+      graph_conv_filters = np.array(graph_conv_filters)
+      assert not np.any(np.isnan(graph_conv_filters))
+      print(graph_conv_filters.dtype)
+
+      # CREATE THE NET
+      X_input = Input(shape=(X.shape[1], X.shape[2]))  # Layer for features matrix X
+      graph_conv_filters_input = Input(shape=(graph_conv_filters.shape[1], graph_conv_filters.shape[2]))  # Layer for A hat matrix
+      print(graph_conv_filters.shape)
+      gc.collect()
+
+      H1 = MultiGraphCNN(C1_units, 2, activation='relu')([X_input, graph_conv_filters_input])
+      D_H1 = Dropout(DropVal_1)(H1)
+      f_H1 = Flatten()(D_H1)
+
+      H2 = MultiGraphCNN(C2_units, 2, activation='relu')([D_H1, graph_conv_filters_input])
+      D_H2 = Dropout(DropVal_2)(H2)
+      f_H2 = Flatten()(D_H2)
+
+      H3 = MultiGraphCNN(16, 2, activation='relu')([D_H2, graph_conv_filters_input])
+      D_H3 = Dropout(0.2)(H3)
+      f_H3 = Flatten()(D_H3)
+
+      #H4 = MultiGraphCNN(1024, 2, activation='relu')([D_H3, graph_conv_filters_input])
+      #D_H4 = Dropout(0.2)(H4)
+      #f_H4 = Flatten()(D_H4)
+
+      #dense_hidden = Dense(1024, activation='linear')
+      #out_1 = dense_hidden(f_H1)
+      #out_2 = dense_hidden(f_H2)
+      #out_3 = dense_hidden(f_H3)
+      #out_4 = dense_hidden(f_H4)
+      #merged_out = concatenate([out_1, out_2], axis=-1)
+
+      output = Dense(D1_units, activation='tanh')(f_H2)
+      output = Dense(1, activation='linear')(output)
+
+      #nb_epochs = epochs
+      batch_size = 128
+
+      # CONFIGURES
+      model = Model(inputs=[X_input,graph_conv_filters_input], outputs=output)
+      #sgd = optimizers.SGD(lr=0.000000000000000000000000000000000000000000000000000000000000000001, decay=1e-6, momentum=0.9, nesterov=False)
+      #rmsprop = optimizers.RMSprop(learning_rate=0.0000000000000000000000000000000000000000000000000000000000000000000000000000000001, rho=0.9)
+      #adam = optimizers.Adam(learning_rate=0.00001, clipnorm = 0.001)
+      early_stop = callbacks.EarlyStopping(monitor='val_loss', min_delta=early_stop_delta, patience=early_stop_patience, verbose=0, mode='auto', baseline=None, restore_best_weights=False)
+
+      model.compile(loss='mean_squared_error', optimizer='adam')  # configures the model for training
+      print(model.summary)
+
+
+      #print(model.summary())  # sanity check
+
+      # PREDICTION
+      X_t = np.stack(x_test['one_hot'])
+      adj_tensor_t = np.stack(x_test['adj_mat'])
+      Y_t = np.column_stack(y_test).transpose()
+      graph_conv_filters_t = []
+      for i in range(adj_tensor_t.shape[0]):
+          adj = adj_tensor_t[i]
+          adj = adj + np.eye(adj.shape[0])
+          d = np.diag(np.power(np.array(adj.sum(1)), -0.5).flatten(), 0)
+          adj = adj.dot(d).transpose().dot(d)
+          adj = np.concatenate([np.eye(adj.shape[0]), adj], axis=0)
+          if np.isnan(adj).any():
+              print("found_nan!")
+          graph_conv_filters_t.append(adj)
+      graph_conv_filters_t = np.array(graph_conv_filters_t)
+
+
+      model.fit([X,graph_conv_filters], Y, batch_size=batch_size, epochs=epochs, verbose=1, validation_split = 0.1, callbacks = [early_stop])
+      preds = model.predict([X_t, graph_conv_filters_t], batch_size=batch_size, verbose=1).T
+      Y_t = Y_t.T
+      res = pearsonr(Y_t[0][:], preds[0][:])
+      print("result for " , protein)
+      print(res)
+
+      del model
+      del x_train
+      del x_test
+      del y_train
+      del y_test
+      del X
+      del Y
+      del X_t
+      del Y_t
+      gc.collect()
+      print("memory cleared")
+      return(res[0])
+
+def updateExcel(sheet, currentAttempt, randIntegers, randFloats):
+    # Not randomized
+    sheet['A'+str(currentAttempt)] = currentAttempt-1   # Iteration number
+    sheet['B'+str(currentAttempt)] = 100                # Epochs     
+    sheet['E'+str(currentAttempt)] = "A"                # input_mat
+    sheet['F'+str(currentAttempt)] = "V"                # input_eye_concat
+    sheet['I'+str(currentAttempt)] =  1                 # Fold/reg edge ratio
+    # Randomized
+    sheet['D'+str(currentAttempt)] = randIntegers[0]    # early_stop_patience
+    sheet['G'+str(currentAttempt)] = randIntegers[1]    # C1_units
+    sheet['H'+str(currentAttempt)] = randIntegers[2]    # C2_units
+    sheet['J'+str(currentAttempt)] = randIntegers[3]    # D1_units
+    sheet['K'+str(currentAttempt)] = randFloats[0]      # DropVal_1
+    sheet['L'+str(currentAttempt)] = randFloats[1]      # DropVal_2
+    sheet['C'+str(currentAttempt)] = randFloats[2]      # early_stop_delta
+
+def main():
+    # Grid search procdeural 
+    wb = load_workbook("/content/drive/My Drive/randSearch_5.xlsx") # Open the excel work sheet
+    sheet = wb.active
+    currentAttempt = int(sheet['R2'].value)
+    sheet['R2'] = currentAttempt + 1     # Update the current index in the excel file
+    print("The current attempt is: ", currentAttempt) 
+    # End of grid search procdeural 
+    gc.collect()
+    np.set_printoptions(threshold=sys.maxsize)
+    # df = prep_first_time()
+    # First, we prepare our data
+    data = pd.read_csv("/content/drive/My Drive/norm_data_raw_mats.csv")
+    proteins = ['RNCMPT00100' , 'RNCMPT00040', 'RNCMPT00016', 'RNCMPT00101', 'RNCMPT00209']
+    for col in data.columns.values:
+        if ((col!='RNA_Seq') & (not(col in proteins)) & (col!='Probe_Set') & (col!='adj_mat_raw')):
+            print("dropping ", col)
+            data = data.drop([col],axis=1)
+    randIntegers = np.random.randint(low = 1, high = 256, size = 4) 
+    randFloats = np.random.uniform(0,1,3)
+    print("The randomized integers are: ", randIntegers)
+    print("The randomized floats are: ", randFloats)
+    updateExcel(sheet, currentAttempt, randIntegers, randFloats)
+    scores = ["M","N","O","P","Q"]
+    index = 0
+    for protein in proteins:
+        result = predict_protein(data,protein,randIntegers[0],randIntegers[1],randIntegers[2],randIntegers[3],randFloats[0],randFloats[1],randFloats[2],100)
+        sheet[scores[index]+str(currentAttempt)] = result
+        index = index + 1
+        wb.save("/content/drive/My Drive/randSearch_5.xlsx") 
+
+if __name__ == "__main__":
+    main()
